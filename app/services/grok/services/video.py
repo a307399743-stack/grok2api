@@ -3,9 +3,11 @@ Grok video generation service.
 """
 
 import asyncio
+import math
 import uuid
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, AsyncGenerator, AsyncIterable, Optional
 
 import orjson
@@ -23,6 +25,7 @@ from app.core.exceptions import (
 )
 from app.services.grok.services.model import ModelService
 from app.services.token import get_token_manager, EffortType
+from app.services.token.manager import BASIC_POOL_NAME
 from app.services.grok.utils.stream import wrap_stream_with_usage
 from app.services.grok.utils.process import (
     BaseProcessor,
@@ -39,6 +42,19 @@ from app.services.grok.utils.upload import UploadService
 
 _VIDEO_SEMAPHORE = None
 _VIDEO_SEM_VALUE = 0
+
+_DIRECT_VIDEO_LENGTHS = {6, 10, 15}
+
+
+@dataclass(frozen=True)
+class VideoRoundPlan:
+    round_index: int
+    total_rounds: int
+    is_extension: bool
+    video_length: int
+    extension_start_time: Optional[float] = None
+
+
 def _get_video_semaphore() -> asyncio.Semaphore:
     """Reverse 接口并发控制（video 服务）。"""
     global _VIDEO_SEMAPHORE, _VIDEO_SEM_VALUE
@@ -56,6 +72,73 @@ def _token_tag(token: str) -> str:
     if len(raw) <= 14:
         return raw
     return f"{raw[:6]}...{raw[-6:]}"
+
+
+def _extract_video_post_id(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if re.fullmatch(r"[0-9a-fA-F-]{32,36}", raw):
+        return raw
+    patterns = (
+        r"/generated/([0-9a-fA-F-]{32,36})(?:/|$)",
+        r"/([0-9a-fA-F-]{32,36})/generated_video",
+        r"/imagine-post/([0-9a-fA-F-]{32,36})(?:/|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw)
+        if match:
+            return match.group(1)
+    matches = re.findall(r"([0-9a-fA-F-]{32,36})", raw)
+    return matches[-1] if matches else ""
+
+
+def _choose_round_length(target_length: int, *, is_super_pool: bool) -> int:
+    target = int(target_length or 6)
+    if target in _DIRECT_VIDEO_LENGTHS:
+        return target
+    if is_super_pool and target >= 10:
+        return 10
+    return 6
+
+
+def _build_round_plan(target_length: int, *, round_length: int) -> list[VideoRoundPlan]:
+    target = max(6, min(30, int(target_length or 6)))
+    step = max(6, min(15, int(round_length or 6)))
+    if target <= step:
+        return [
+            VideoRoundPlan(
+                round_index=1,
+                total_rounds=1,
+                is_extension=False,
+                video_length=target,
+                extension_start_time=None,
+            )
+        ]
+
+    ext_rounds = int(math.ceil((target - step) / step))
+    total_rounds = 1 + ext_rounds
+    plan: list[VideoRoundPlan] = [
+        VideoRoundPlan(
+            round_index=1,
+            total_rounds=total_rounds,
+            is_extension=False,
+            video_length=step,
+            extension_start_time=None,
+        )
+    ]
+    for i in range(1, ext_rounds + 1):
+        round_target = min(target, step * (i + 1))
+        plan.append(
+            VideoRoundPlan(
+                round_index=i + 1,
+                total_rounds=total_rounds,
+                is_extension=True,
+                video_length=step,
+                extension_start_time=float(round_target - step),
+            )
+        )
+    return plan
 
 
 async def _fetch_media_post_info(token: str, post_id: str) -> dict[str, Any]:
@@ -1188,7 +1271,6 @@ class VideoService:
         single_image_mode: str = "frame",
     ):
         """Video generation entrypoint."""
-        # Get token via intelligent routing.
         token_mgr = await get_token_manager()
         await token_mgr.reload_if_stale()
 
@@ -1201,7 +1283,6 @@ class VideoService:
             show_think = reasoning_effort != "none"
         is_stream = stream if stream is not None else get_config("app.stream")
 
-        # Extract content.
         from app.services.grok.services.chat import MessageExtractor
 
         prompt, file_attachments, image_attachments = MessageExtractor.extract(messages)
@@ -1219,14 +1300,16 @@ class VideoService:
                 for index, image_url in enumerate(image_attachments, start=1)
                 if str(image_url or "").strip()
             ]
+
+        requested_video_length = max(6, min(30, int(video_length or 6)))
+        explicit_extension = bool(extend_post_id and video_extension_start_time is not None)
         used_tokens: set[str] = set()
 
         for attempt in range(max_token_retries):
-            # 统一从当前池内 token 选择，不再复用历史绑定 token。
             pool_candidates = ModelService.pool_candidates_for_model(model)
             token_info = token_mgr.get_token_for_video(
                 resolution=resolution,
-                video_length=video_length,
+                video_length=requested_video_length,
                 pool_candidates=pool_candidates,
                 exclude=used_tokens,
             )
@@ -1247,122 +1330,27 @@ class VideoService:
 
             used_tokens.add(token)
             should_upscale = bool(get_config("video.auto_upscale", True))
+            token_pool_name = token_mgr.get_pool_name_for_token(token) or BASIC_POOL_NAME
+            is_super_pool = token_pool_name != BASIC_POOL_NAME
 
             try:
-                # Handle image attachments.
                 image_url = None
                 if (not parent_post_id) and image_attachments and not reference_items:
                     upload_service = UploadService()
                     try:
                         for attach_data in image_attachments:
-                            _, file_uri = await upload_service.upload_file(
-                                attach_data, token
-                            )
+                            _, file_uri = await upload_service.upload_file(attach_data, token)
                             image_url = f"https://assets.grok.com/{file_uri}"
                             logger.info(f"Image uploaded for video: {image_url}")
                             break
                     finally:
                         await upload_service.close()
 
-                # Generate video.
                 service = VideoService()
-                if extend_post_id and video_extension_start_time is not None:
-                    # 视频延长路径
-                    response = await service.generate_extend_video(
-                        token=token,
-                        prompt=prompt,
-                        extend_post_id=extend_post_id,
-                        video_extension_start_time=video_extension_start_time,
-                        original_post_id=original_post_id or "",
-                        file_attachment_id=file_attachment_id or "",
-                        aspect_ratio=aspect_ratio,
-                        video_length=video_length,
-                        resolution=resolution,
-                        preset=preset,
-                        stitch_with_extend=stitch_with_extend,
-                    )
-                elif len(reference_items) > 1:
-                    response = await service.generate_from_reference_items(
-                        token=token,
-                        prompt=prompt,
-                        reference_items=reference_items,
-                        aspect_ratio=aspect_ratio,
-                        video_length=video_length,
-                        resolution=resolution,
-                        preset=preset,
-                    )
-                elif parent_post_id:
-                    response = await service.generate_from_parent_post(
-                        token=token,
-                        prompt=prompt,
-                        parent_post_id=parent_post_id,
-                        source_image_url=source_image_url,
-                        aspect_ratio=aspect_ratio,
-                        video_length=video_length,
-                        resolution=resolution,
-                        preset=preset,
-                    )
-                elif len(reference_items) == 1:
-                    item = reference_items[0]
-                    single_parent_post_id = str(item.get("parent_post_id") or "").strip()
-                    single_source_image_url = str(item.get("source_image_url") or item.get("image_url") or "").strip()
-                    effective_single_image_mode = str(single_image_mode or "frame").strip().lower() or "frame"
-                    if single_parent_post_id:
-                        response = await service.generate_from_parent_post(
-                            token=token,
-                            prompt=prompt,
-                            parent_post_id=single_parent_post_id,
-                            source_image_url=single_source_image_url,
-                            aspect_ratio=aspect_ratio,
-                            video_length=video_length,
-                            resolution=resolution,
-                            preset=preset,
-                        )
-                    elif effective_single_image_mode == "reference":
-                        response = await service.generate_from_reference_items(
-                            token=token,
-                            prompt=prompt,
-                            reference_items=reference_items,
-                            aspect_ratio=aspect_ratio,
-                            video_length=video_length,
-                            resolution=resolution,
-                            preset=preset,
-                        )
-                    else:
-                        response = await service.generate_from_image(
-                            token,
-                            prompt,
-                            single_source_image_url,
-                            aspect_ratio,
-                            video_length,
-                            resolution,
-                            preset,
-                        )
-                elif image_url:
-                    response = await service.generate_from_image(
-                        token,
-                        prompt,
-                        image_url,
-                        aspect_ratio,
-                        video_length,
-                        resolution,
-                        preset,
-                    )
-                else:
-                    response = await service.generate(
-                        token,
-                        prompt,
-                        aspect_ratio,
-                        video_length,
-                        resolution,
-                        preset,
-                    )
 
-                # Process response.
-                if is_stream:
+                async def _merge_with_first_chunk(response_stream):
                     try:
-                        stream_iter = response.__aiter__()
-                        # 诱发初始请求，若发生 401 等异常，将在 completions 的 try 块内被捕捉。
+                        stream_iter = response_stream.__aiter__()
                         first_chunk = await stream_iter.__anext__()
                     except StopAsyncIteration:
                         first_chunk = None
@@ -1373,8 +1361,254 @@ class VideoService:
                         async for chunk in remaining:
                             yield chunk
 
-                    combined_response = _merged_stream(first_chunk, stream_iter)
-                    
+                    return _merged_stream(first_chunk, stream_iter)
+
+                async def _run_collect(response_stream):
+                    return await VideoCollectProcessor(
+                        model,
+                        token,
+                        upscale_on_finish=should_upscale,
+                        idle_timeout_override=None,
+                    ).process(response_stream)
+
+                async def _consume_usage():
+                    try:
+                        model_info = ModelService.get(model)
+                        effort = (
+                            EffortType.HIGH
+                            if (model_info and model_info.cost.value == "high")
+                            else EffortType.LOW
+                        )
+                        await token_mgr.consume(token, effort)
+                        logger.debug(
+                            f"Video completed, recorded usage (effort={effort.value})"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to record video usage: {e}")
+
+                async def _run_first_round(round_video_length: int):
+                    if explicit_extension:
+                        return await service.generate_extend_video(
+                            token=token,
+                            prompt=prompt,
+                            extend_post_id=extend_post_id or "",
+                            video_extension_start_time=float(video_extension_start_time or 0.0),
+                            original_post_id=original_post_id or "",
+                            file_attachment_id=file_attachment_id or "",
+                            aspect_ratio=aspect_ratio,
+                            video_length=round_video_length,
+                            resolution=resolution,
+                            preset=preset,
+                            stitch_with_extend=stitch_with_extend,
+                        )
+
+                    if len(reference_items) > 1:
+                        return await service.generate_from_reference_items(
+                            token=token,
+                            prompt=prompt,
+                            reference_items=reference_items,
+                            aspect_ratio=aspect_ratio,
+                            video_length=round_video_length,
+                            resolution=resolution,
+                            preset=preset,
+                        )
+
+                    if parent_post_id:
+                        return await service.generate_from_parent_post(
+                            token=token,
+                            prompt=prompt,
+                            parent_post_id=parent_post_id,
+                            source_image_url=source_image_url,
+                            aspect_ratio=aspect_ratio,
+                            video_length=round_video_length,
+                            resolution=resolution,
+                            preset=preset,
+                        )
+
+                    if len(reference_items) == 1:
+                        item = reference_items[0]
+                        single_parent_post_id = str(item.get("parent_post_id") or "").strip()
+                        single_source_image_url = str(
+                            item.get("source_image_url") or item.get("image_url") or ""
+                        ).strip()
+                        effective_single_image_mode = (
+                            str(single_image_mode or "frame").strip().lower() or "frame"
+                        )
+                        if single_parent_post_id:
+                            return await service.generate_from_parent_post(
+                                token=token,
+                                prompt=prompt,
+                                parent_post_id=single_parent_post_id,
+                                source_image_url=single_source_image_url,
+                                aspect_ratio=aspect_ratio,
+                                video_length=round_video_length,
+                                resolution=resolution,
+                                preset=preset,
+                            )
+                        if effective_single_image_mode == "reference":
+                            return await service.generate_from_reference_items(
+                                token=token,
+                                prompt=prompt,
+                                reference_items=reference_items,
+                                aspect_ratio=aspect_ratio,
+                                video_length=round_video_length,
+                                resolution=resolution,
+                                preset=preset,
+                            )
+                        return await service.generate_from_image(
+                            token,
+                            prompt,
+                            single_source_image_url,
+                            aspect_ratio,
+                            round_video_length,
+                            resolution,
+                            preset,
+                        )
+
+                    if image_url:
+                        return await service.generate_from_image(
+                            token,
+                            prompt,
+                            image_url,
+                            aspect_ratio,
+                            round_video_length,
+                            resolution,
+                            preset,
+                        )
+
+                    return await service.generate(
+                        token,
+                        prompt,
+                        aspect_ratio,
+                        round_video_length,
+                        resolution,
+                        preset,
+                    )
+
+                async def _run_extension_round(
+                    *,
+                    plan: VideoRoundPlan,
+                    chain_last_post_id: str,
+                    chain_original_post_id: str,
+                ):
+                    if not chain_last_post_id or not chain_original_post_id:
+                        raise UpstreamException(
+                            message="Video chain extension missing post id",
+                            status_code=502,
+                            details={"type": "missing_post_id", "round": plan.round_index},
+                        )
+                    return await service.generate_extend_video(
+                        token=token,
+                        prompt=prompt,
+                        extend_post_id=chain_last_post_id,
+                        video_extension_start_time=float(plan.extension_start_time or 0.0),
+                        original_post_id=chain_original_post_id,
+                        file_attachment_id=chain_original_post_id,
+                        aspect_ratio=aspect_ratio,
+                        video_length=plan.video_length,
+                        resolution=resolution,
+                        preset=preset,
+                        stitch_with_extend=True,
+                    )
+
+                chain_plan: list[VideoRoundPlan]
+                if explicit_extension:
+                    chain_plan = [
+                        VideoRoundPlan(
+                            round_index=1,
+                            total_rounds=1,
+                            is_extension=True,
+                            video_length=requested_video_length,
+                            extension_start_time=float(video_extension_start_time or 0.0),
+                        )
+                    ]
+                else:
+                    round_length = _choose_round_length(
+                        requested_video_length,
+                        is_super_pool=is_super_pool,
+                    )
+                    chain_plan = _build_round_plan(
+                        requested_video_length,
+                        round_length=round_length,
+                    )
+
+                auto_chain_enabled = (not explicit_extension) and len(chain_plan) > 1
+                if auto_chain_enabled:
+                    logger.info(
+                        "Video auto-chain enabled: "
+                        f"target={requested_video_length}s, rounds={len(chain_plan)}, "
+                        f"round_length={chain_plan[0].video_length}, token_pool={token_pool_name}"
+                    )
+
+                if auto_chain_enabled:
+                    chain_last_post_id = ""
+                    chain_original_post_id = ""
+                    final_result: Optional[dict[str, Any]] = None
+                    total_rounds = len(chain_plan)
+
+                    for plan in chain_plan:
+                        is_final_round = plan.round_index == total_rounds
+                        if plan.is_extension:
+                            response = await _run_extension_round(
+                                plan=plan,
+                                chain_last_post_id=chain_last_post_id,
+                                chain_original_post_id=chain_original_post_id,
+                            )
+                        else:
+                            response = await _run_first_round(plan.video_length)
+
+                        if is_final_round and is_stream:
+                            combined_response = await _merge_with_first_chunk(response)
+                            processor = VideoStreamProcessor(
+                                model,
+                                token,
+                                show_think,
+                                upscale_on_finish=should_upscale,
+                                idle_timeout_override=None,
+                            )
+                            return wrap_stream_with_usage(
+                                processor.process(combined_response), token_mgr, token, model
+                            )
+
+                        round_result = await _run_collect(response)
+                        round_post_id = str(round_result.get("post_id") or "").strip()
+                        if not round_post_id:
+                            try:
+                                content = str(
+                                    (round_result.get("choices") or [{}])[0]
+                                    .get("message", {})
+                                    .get("content", "")
+                                )
+                            except Exception:
+                                content = ""
+                            round_post_id = _extract_video_post_id(content)
+                        if not round_post_id:
+                            raise UpstreamException(
+                                message=f"Video chain round {plan.round_index} missing post_id",
+                                status_code=502,
+                                details={"type": "missing_post_id", "round": plan.round_index},
+                            )
+
+                        if not chain_original_post_id:
+                            chain_original_post_id = round_post_id
+                        chain_last_post_id = round_post_id
+
+                        if is_final_round:
+                            final_result = round_result
+
+                    if final_result is None:
+                        raise UpstreamException(
+                            message="Video chain did not produce final result",
+                            status_code=502,
+                            details={"type": "empty_video_result"},
+                        )
+                    await _consume_usage()
+                    return final_result
+
+                # Single-round path.
+                response = await _run_first_round(chain_plan[0].video_length)
+                if is_stream:
+                    combined_response = await _merge_with_first_chunk(response)
                     processor = VideoStreamProcessor(
                         model,
                         token,
@@ -1386,25 +1620,8 @@ class VideoService:
                         processor.process(combined_response), token_mgr, token, model
                     )
 
-                result = await VideoCollectProcessor(
-                    model,
-                    token,
-                    upscale_on_finish=should_upscale,
-                    idle_timeout_override=None,
-                ).process(response)
-                try:
-                    model_info = ModelService.get(model)
-                    effort = (
-                        EffortType.HIGH
-                        if (model_info and model_info.cost.value == "high")
-                        else EffortType.LOW
-                    )
-                    await token_mgr.consume(token, effort)
-                    logger.debug(
-                        f"Video completed, recorded usage (effort={effort.value})"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to record video usage: {e}")
+                result = await _run_collect(response)
+                await _consume_usage()
                 return result
 
             except UpstreamException as e:
@@ -2176,6 +2393,7 @@ class VideoCollectProcessor(BaseProcessor):
                 }
             ],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "post_id": post_id,
         }
 
 
