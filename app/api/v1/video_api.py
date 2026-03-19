@@ -18,7 +18,7 @@ class VideoExtendRequest(BaseModel):
     model: str = Field("grok-imagine-1.0-video", description="模型名称")
     post_id: str = Field(..., description="原始视频的 post_id")
     prompt: Optional[str] = Field(None, description="延长描述词")
-    video_length: Optional[int] = Field(6, description="延长时长 (6/10/15)")
+    video_length: Optional[int] = Field(6, description="延长时长 (6-30)")
     aspect_ratio: Optional[str] = Field("16:9", description="视频比例")
     resolution: Optional[str] = Field("480p", description="分辨率 (480p/720p)")
     stream: Optional[bool] = Field(True, description="是否流式返回")
@@ -33,7 +33,12 @@ async def extend_video(request: VideoExtendRequest, raw_request: Request):
     # 自动偏移并限制 30s 逻辑
     # Grok 延长时长固定为 6s 或 10s，总长上限 30s
     extension_start = request.video_extension_start_time or 0.0
-    requested_length = request.video_length or 6
+    requested_length = int(request.video_length or 6)
+    if requested_length < 6 or requested_length > 30:
+        return _chat_error_as_success_response(
+            request.model,
+            "video_length must be between 6 and 30 seconds",
+        )
 
     # 如果用户请求的长超过 30s 剩余空间，则我们将开始时间“往前回拨”以容纳该长度，
     # 但最高不能超过 30s。若回拨到 0 还是放不下，则由底层处理。

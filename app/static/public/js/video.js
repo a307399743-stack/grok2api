@@ -1441,12 +1441,22 @@
     }
   }
 
+  function parseVideoLengthInput(inputEl, fallback = 6) {
+    const fallbackNumber = Number.isFinite(Number(fallback)) ? Number(fallback) : 6;
+    const fallbackSafe = Math.max(6, Math.min(30, Math.round(fallbackNumber)));
+    if (!inputEl) return fallbackSafe;
+    const raw = Number.parseInt(String(inputEl.value || '').trim(), 10);
+    const safe = Number.isFinite(raw) ? Math.max(6, Math.min(30, raw)) : fallbackSafe;
+    inputEl.value = String(safe);
+    return safe;
+  }
+
   function updateMeta() {
     if (aspectValue && ratioSelect) {
       aspectValue.textContent = ratioSelect.value;
     }
     if (lengthValue && lengthSelect) {
-      lengthValue.textContent = `${lengthSelect.value}s`;
+      lengthValue.textContent = `${parseVideoLengthInput(lengthSelect, 6)}s`;
     }
     if (resolutionValue && resolutionSelect) {
       resolutionValue.textContent = resolutionSelect.value;
@@ -1832,7 +1842,7 @@
         reference_items: referenceItems,
         reasoning_effort: DEFAULT_REASONING_EFFORT,
         aspect_ratio: ratioSelect ? ratioSelect.value : '3:2',
-        video_length: lengthSelect ? parseInt(lengthSelect.value, 10) : 6,
+        video_length: parseVideoLengthInput(lengthSelect, 6),
         resolution_name: resolutionSelect ? resolutionSelect.value : '480p',
         preset: presetSelect ? presetSelect.value : 'normal',
         single_image_mode: singleImageModeSelect ? singleImageModeSelect.value : 'frame',
@@ -2542,7 +2552,7 @@
         source_image_url: null,
         reasoning_effort: DEFAULT_REASONING_EFFORT,
         aspect_ratio: ratioSelect ? ratioSelect.value : '3:2',
-        video_length: lengthSelect ? parseInt(lengthSelect.value, 10) : 6,
+        video_length: parseVideoLengthInput(lengthSelect, 6),
         resolution_name: resolutionSelect ? resolutionSelect.value : '480p',
         preset: presetSelect ? presetSelect.value : 'custom',
         single_image_mode: 'frame',
@@ -2709,7 +2719,7 @@
       const body = {
         prompt: prompt,
         aspect_ratio: ratioSelect ? ratioSelect.value : '16:9',
-        video_length: editLengthSelect ? parseInt(editLengthSelect.value, 10) : 10,
+        video_length: parseVideoLengthInput(editLengthSelect, 10),
         resolution_name: resolutionSelect ? resolutionSelect.value : '480p',
         preset: (!prompt || prompt.trim() === '') ? 'spicy' : (presetSelect ? presetSelect.value : 'normal'),
         reasoning_effort: typeof DEFAULT_REASONING_EFFORT !== 'undefined' ? DEFAULT_REASONING_EFFORT : null,
@@ -3651,6 +3661,20 @@
     .filter(Boolean)
     .forEach((el) => {
       el.addEventListener('change', updateMeta);
+    });
+
+  [lengthSelect, editLengthSelect]
+    .filter(Boolean)
+    .forEach((el) => {
+      const fallback = el === editLengthSelect ? 10 : 6;
+      el.addEventListener('input', () => {
+        parseVideoLengthInput(el, fallback);
+        updateMeta();
+      });
+      el.addEventListener('blur', () => {
+        parseVideoLengthInput(el, fallback);
+        updateMeta();
+      });
     });
 
   updateMeta();

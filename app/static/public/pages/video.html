@@ -213,18 +213,11 @@
               </div>
               <div class="settings-block">
                 <label class="field-label" for="lengthSelect">视频时长</label>
-                <select id="lengthSelect" class="geist-input">
-                  <option value="6" selected>6 秒</option>
-                  <option value="10">10 秒</option>
-                  <option value="15">15 秒</option>
-                </select>
+                <input id="lengthSelect" class="geist-input" type="number" min="6" max="30" step="1" value="6" />
               </div>
               <div class="settings-block">
                 <label class="field-label" for="editLengthSelect">延长时长</label>
-                <select id="editLengthSelect" class="geist-input">
-                  <option value="6">6 秒</option>
-                  <option value="10" selected>10 秒</option>
-                </select>
+                <input id="editLengthSelect" class="geist-input" type="number" min="6" max="30" step="1" value="10" />
               </div>
               <div class="settings-block">
                 <label class="field-label" for="resolutionSelect">分辨率</label>

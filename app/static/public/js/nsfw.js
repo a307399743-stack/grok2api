@@ -75,6 +75,16 @@
     }
   }
 
+  function parseVideoLengthInput(inputEl, fallback = 6) {
+    const fallbackNumber = Number.isFinite(Number(fallback)) ? Number(fallback) : 6;
+    const fallbackSafe = Math.max(6, Math.min(30, Math.round(fallbackNumber)));
+    if (!inputEl) return fallbackSafe;
+    const raw = Number.parseInt(String(inputEl.value || '').trim(), 10);
+    const safe = Number.isFinite(raw) ? Math.max(6, Math.min(30, raw)) : fallbackSafe;
+    inputEl.value = String(safe);
+    return safe;
+  }
+
   function ensureVideoRenameDialog() {
     let overlay = document.getElementById('nsfwVideoRenameDialog');
     if (overlay) return overlay;
@@ -1718,7 +1728,7 @@
     const payload = {
       prompt,
       aspect_ratio: ratioSelect ? ratioSelect.value : '16:9',
-      video_length: parseInt(videoLengthSelect?.value || '6', 10),
+      video_length: parseVideoLengthInput(videoLengthSelect, 6),
       resolution_name: resolutionSelect ? resolutionSelect.value : '480p',
       preset,
       parent_post_id: selected.parentPostId,
@@ -1938,6 +1948,14 @@
   if (stopVideoBtn) {
     stopVideoBtn.addEventListener('click', () => {
       stopVideos(false);
+    });
+  }
+  if (videoLengthSelect) {
+    videoLengthSelect.addEventListener('input', () => {
+      parseVideoLengthInput(videoLengthSelect, 6);
+    });
+    videoLengthSelect.addEventListener('blur', () => {
+      parseVideoLengthInput(videoLengthSelect, 6);
     });
   }
   if (clearVideosBtn) {
